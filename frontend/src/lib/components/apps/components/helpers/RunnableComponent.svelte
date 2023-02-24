@@ -1,0 +1,319 @@
+<script lang="ts">
+	import { goto } from '$app/navigation'
+	import type { Schema } from '$lib/common'
+	import Alert from '$lib/components/common/alert/Alert.svelte'
+	import SchemaForm from '$lib/components/SchemaForm.svelte'
+	import TestJobLoader from '$lib/components/TestJobLoader.svelte'
+	import { AppService, type CompletedJob } from '$lib/gen'
+	import { defaultIfEmptyString, emptySchema, sendUserToast } from '$lib/utils'
+	import { getContext, onMount } from 'svelte'
+	import { computeFields } from '../../editor/inlineScriptsPanel/utils'
+	import type { AppInputs, Runnable } from '../../inputType'
+	import type { Output } from '../../rx'
+	import type { AppEditorContext } from '../../types'
+	import InputValue from './InputValue.svelte'
+	import RefreshButton from './RefreshButton.svelte'
+
+	// Component props
+	export let id: string
+	export let fields: AppInputs
+	export let runnable: Runnable
+	export let extraQueryParams: Record<string, any> = {}
+	export let autoRefresh: boolean = true
+	export let result: any = undefined
+	export let forceSchemaDisplay: boolean = false
+	export let defaultUserInput = false
+	export let flexWrap = false
+	export let wrapperClass = ''
+	export let initializing: boolean | undefined = undefined
+	export let gotoUrl: string | undefined = undefined
+
+	const {
+		worldStore,
+		runnableComponents,
+		workspace,
+		appPath,
+		isEditor,
+		jobs,
+		noBackend,
+		errorByComponent,
+		mode
+	} = getContext<AppEditorContext>('AppEditorContext')
+
+	onMount(() => {
+		if (autoRefresh) {
+			$runnableComponents[id] = async () => {
+				await executeComponent(true)
+			}
+			executeComponent(true)
+		}
+	})
+
+	let args: Record<string, any> = {}
+	let testIsLoading = false
+	let runnableInputValues: Record<string, any> = {}
+	let executeTimeout: NodeJS.Timeout | undefined = undefined
+
+	function setDebouncedExecute() {
+		executeTimeout && clearTimeout(executeTimeout)
+		executeTimeout = setTimeout(() => {
+			executeComponent(true)
+		}, 200)
+	}
+
+	function computeStaticValues() {
+		return Object.entries(fields ?? {})
+			.filter(([k, v]) => v.type == 'static')
+			.map(([name, field]) => {
+				return [name, field['value']]
+			})
+	}
+
+	let lazyStaticValues = computeStaticValues()
+	let currentStaticValues = lazyStaticValues
+
+	$: fields && (currentStaticValues = computeStaticValues())
+	$: if (JSON.stringify(currentStaticValues) != JSON.stringify(lazyStaticValues)) {
+		lazyStaticValues = currentStaticValues
+
+		if (autoRefresh) {
+			setDebouncedExecute()
+		}
+	}
+
+	$: fields && (lazyStaticValues = computeStaticValues())
+	$: runnableInputValues &&
+		extraQueryParams &&
+		args &&
+		autoRefresh &&
+		testJobLoader &&
+		setDebouncedExecute()
+
+	// Test job internal state
+	let testJob: CompletedJob | undefined = undefined
+	let testJobLoader: TestJobLoader | undefined = undefined
+
+	$: outputs = $worldStore?.outputsById[id] as {
+		result: Output<Array<any>>
+		loading: Output<boolean>
+	}
+
+	$: if (outputs?.loading != undefined) {
+		outputs.loading.set(false, true)
+	}
+
+	$: outputs?.loading?.set(testIsLoading)
+
+	$: runnable?.type === 'runnableByName' && loadSchemaAndInputsByName()
+
+	async function loadSchemaAndInputsByName() {
+		if (runnable?.type === 'runnableByName') {
+			const { inlineScript } = runnable
+			// Inline scripts directly provide the schema
+			if (inlineScript) {
+				const newSchema = inlineScript.schema
+
+				const newFields = computeFields(newSchema, defaultUserInput, fields)
+
+				if (JSON.stringify(newFields) !== JSON.stringify(fields)) {
+					setTimeout(() => {
+						fields = newFields
+					}, 0)
+				}
+			}
+		}
+	}
+
+	$: schemaStripped = runnable && stripSchema(fields)
+
+	function stripSchema(inputs: AppInputs): Schema {
+		let schema =
+			runnable?.type == 'runnableByName' ? runnable.inlineScript?.schema : runnable?.schema
+		try {
+			schemaStripped = JSON.parse(JSON.stringify(schema))
+		} catch (e) {
+			console.warn('Error loading schema')
+			return emptySchema()
+		}
+
+		// Remove hidden static inputs
+		Object.keys(inputs ?? {}).forEach((key: string) => {
+			const input = inputs[key]
+
+			if (input.type === 'static' && schemaStripped !== undefined) {
+				delete schemaStripped.properties[key]
+			}
+
+			if (input.type === 'connected' && schemaStripped !== undefined) {
+				delete schemaStripped.properties[key]
+			}
+		})
+		return schemaStripped as Schema
+	}
+
+	$: disabledArgs = Object.keys(fields ?? {}).reduce(
+		(disabledArgsAccumulator: string[], inputName: string) => {
+			if (fields[inputName].type === 'static') {
+				disabledArgsAccumulator = [...disabledArgsAccumulator, inputName]
+			}
+			return disabledArgsAccumulator
+		},
+		[]
+	)
+
+	async function executeComponent(noToast = false) {
+		if (noBackend) {
+			if (!noToast) {
+				sendUserToast('This app is not connected to a windmill backend, it is a static preview')
+			}
+			return
+		}
+		if (runnable?.type === 'runnableByName' && !runnable.inlineScript) {
+			return
+		}
+
+		outputs?.loading?.set(true)
+
+		let njob = await testJobLoader?.abstractRun(() => {
+			const nonStaticRunnableInputs = {}
+			const staticRunnableInputs = {}
+			Object.keys(fields ?? {}).forEach((k) => {
+				let field = fields[k]
+				if (field?.type == 'static' && fields[k]) {
+					staticRunnableInputs[k] = field.value
+				} else if (field?.type == 'user') {
+					nonStaticRunnableInputs[k] = args[k]
+				} else {
+					nonStaticRunnableInputs[k] = runnableInputValues[k]
+				}
+			})
+
+			const requestBody = {
+				args: nonStaticRunnableInputs,
+				force_viewer_static_fields: !isEditor ? undefined : staticRunnableInputs
+			}
+
+			if (runnable?.type === 'runnableByName') {
+				const { inlineScript } = runnable
+
+				if (inlineScript) {
+					requestBody['raw_code'] = {
+						content: inlineScript.content,
+						language: inlineScript.language,
+						path: inlineScript.path
+					}
+				}
+			} else if (runnable?.type === 'runnableByPath') {
+				const { path, runType } = runnable
+				requestBody['path'] = runType !== 'hubscript' ? `${runType}/${path}` : `script/${path}`
+			}
+
+			return AppService.executeComponent({
+				workspace,
+				path: defaultIfEmptyString(appPath, 'newapp'),
+				requestBody
+			})
+		})
+		if (njob) {
+			$jobs = [{ job: njob, component: id }, ...$jobs]
+		}
+	}
+
+	export async function runComponent() {
+		await executeComponent()
+	}
+
+	let lastStartedAt: number = Date.now()
+
+	function recordError(error: string) {
+		if (testJob) {
+			$errorByComponent[testJob.id] = {
+				error: error,
+				componentId: id
+			}
+		}
+	}
+
+	$: result?.error && recordError(result.error)
+</script>
+
+{#each Object.entries(fields ?? {}) as [key, v]}
+	{#if v.type != 'static' && v.type != 'user'}
+		<InputValue
+			{id}
+			input={fields[key]}
+			bind:value={runnableInputValues[key]}
+			row={extraQueryParams['row'] ?? {}}
+		/>
+	{/if}
+{/each}
+
+<TestJobLoader
+	workspaceOverride={workspace}
+	on:done={(e) => {
+		if (testJob && outputs) {
+			const startedAt = new Date(testJob.started_at).getTime()
+			if (startedAt > lastStartedAt) {
+				lastStartedAt = startedAt
+				outputs.result?.set(testJob?.result)
+				result = testJob.result
+
+				const previousJobId = Object.keys($errorByComponent).find(
+					(key) => $errorByComponent[key].componentId === id
+				)
+
+				if (previousJobId && !result?.error) {
+					delete $errorByComponent[previousJobId]
+					$errorByComponent = $errorByComponent
+				}
+				gotoUrl && gotoUrl != '' && result?.error == undefined && goto(gotoUrl)
+			}
+		}
+	}}
+	bind:isLoading={testIsLoading}
+	bind:job={testJob}
+	bind:this={testJobLoader}
+/>
+
+<div class="h-full flex relative flex-row flex-wrap {wrapperClass}">
+	{#if !initializing && autoRefresh === true}
+		<div class="flex absolute top-1 right-1">
+			<RefreshButton componentId={id} />
+		</div>
+	{/if}
+	{#if schemaStripped && Object.keys(schemaStripped?.properties ?? {}).length > 0 && (autoRefresh || forceSchemaDisplay)}
+		<div class="px-2 h-fit min-h-0">
+			<SchemaForm
+				{flexWrap}
+				schema={schemaStripped}
+				bind:args
+				{disabledArgs}
+				shouldHideNoInputs
+				noVariablePicker
+			/>
+		</div>
+	{/if}
+
+	{#if !runnable && autoRefresh}
+		<Alert type="warning" size="xs" class="mt-2 px-1" title="Missing runnable">
+			Please select a runnable
+		</Alert>
+	{:else if result?.error && $mode === 'preview'}
+		<div class="p-2">
+			<Alert type="error" title="Error during execution">
+				<div class="flex flex-col gap-2">
+					An error occured, please contact the app author.
+					<span class="font-semibold">Job id: {testJob?.id}</span>
+					<pre class=" whitespace-pre-wrap text-gray-900 bg-white border w-full p-4 text-xs"
+						>{JSON.stringify(result.error, null, 4)}
+				</pre>
+				</div>
+			</Alert>
+			<slot />
+		</div>
+	{:else}
+		<div class="block grow w-full max-h-full">
+			<slot />
+		</div>
+	{/if}
+</div>
